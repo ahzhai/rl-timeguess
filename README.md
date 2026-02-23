@@ -3,10 +3,9 @@ all the requirements are in requirements.txt
 create conda env and run
 pip install -r requirements.txt
 
-## Dataset stats
+### Dataset stats
 
-### Totals
-
+**Totals**
 | Metric | Value |
 |--------|-------|
 | Total records | 529,506 |
@@ -15,8 +14,7 @@ pip install -r requirements.txt
 | Year range | 1970 – 2021 |
 | Missing values | None |
 
-### Record examples (Bangkok)
-
+**record examples (bangkok)**
 | place_id | year | month | northdeg | city_id | lat | lon | panoid | city |
 |----------|------|-------|----------|---------|-----|-----|--------|------|
 | 4213 | 2011 | 9 | 536 | Bangkok | 13.763345 | 100.523557 | QKQ1Vdq9y_N2mQHwoKmn0Q | Bangkok |
@@ -25,8 +23,7 @@ pip install -r requirements.txt
 | 2644 | 2011 | 9 | 428 | Bangkok | 13.745135 | 100.519753 | CgWBI1vML3xSoCjRn9GIng | Bangkok |
 | 3542 | 2011 | 12 | 551 | Bangkok | 13.755714 | 100.543583 | D5SljekWYMwngMKVOAvXgg | Bangkok |
 
-### Records per year (all cities)
-
+**Records per year (all cities)**
 | Year | Count |
 |------|-------|
 | 1970 | 2 |
@@ -46,8 +43,7 @@ pip install -r requirements.txt
 | 2020 | 29,551 |
 | 2021 | 3 |
 
-### Per-city summary
-
+**Per-city summary**
 | City | Records | Year min | Year max | Lat min | Lat max | Lon min | Lon max |
 |------|---------|----------|----------|---------|---------|---------|---------|
 | Bangkok | 22,271 | 1970 | 2020 | 13.714676 | 13.772345 | 100.483017 | 100.570507 |
