@@ -24,10 +24,13 @@ RANDOM_SEED = 42
 IMG_SIZE = 224
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
+EARTH_RADIUS_M = 6_371_000.0
+GEOGUESSR_TOLERANCE_M = 25.0
+GEOGUESSR_K_M = 2_150_330.0
 
 
-def haversine_km(lat1_deg, lon1_deg, lat2_deg, lon2_deg):
-    """Geodesic distance in km between (lat1, lon1) and (lat2, lon2) in degrees."""
+def haversine_m(lat1_deg, lon1_deg, lat2_deg, lon2_deg):
+    """Great-circle distance in meters between (lat1, lon1) and (lat2, lon2) in degrees."""
     lat1 = math.radians(lat1_deg)
     lon1 = math.radians(lon1_deg)
     lat2 = math.radians(lat2_deg)
@@ -36,7 +39,7 @@ def haversine_km(lat1_deg, lon1_deg, lat2_deg, lon2_deg):
     dlon = lon2 - lon1
     a = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
     c = 2 * math.asin(math.sqrt(a))
-    return 6371.0 * c  # Earth radius km
+    return EARTH_RADIUS_M * c
 
 
 def build_path(row, data_root):
@@ -122,22 +125,30 @@ class CNNGeo(nn.Module):
         return self.head(feat)
 
 
-def median_geodesic_km(pred_latlon, true_latlon):
+def geoguessr_score(lat1_deg, lon1_deg, lat2_deg, lon2_deg, tolerance_m=GEOGUESSR_TOLERANCE_M, k_m=GEOGUESSR_K_M):
+    """GeoGuessr-style score in [0, 5000] using exponential decay over haversine distance."""
+    dist_m = haversine_m(lat1_deg, lon1_deg, lat2_deg, lon2_deg)
+    if dist_m <= tolerance_m:
+        return 5000.0
+    return 5000.0 * math.exp(-dist_m / k_m)
+
+
+def median_geoguessr_score(pred_latlon, true_latlon):
     """pred_latlon, true_latlon: (N, 2) tensors [lat, lon] in degrees."""
     pred = pred_latlon.cpu().numpy()
     true = true_latlon.cpu().numpy()
-    dists = [
-        haversine_km(pred[i, 0], pred[i, 1], true[i, 0], true[i, 1])
+    scores = [
+        geoguessr_score(pred[i, 0], pred[i, 1], true[i, 0], true[i, 1])
         for i in range(len(pred))
     ]
-    return float(torch.tensor(dists).median().item()), sum(dists) / len(dists)
+    return float(torch.tensor(scores).median().item()), sum(scores) / len(scores)
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--metadata", type=str, default="data/gsv-cities/Dataframes", help="Path to Dataframes dir (per-city CSVs)")
     parser.add_argument("--data_root", type=str, default="data/gsv-cities", help="Path to gsv-cities root (parent of Images/)")
-    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--samples_per_city", type=int, default=100)
@@ -210,8 +221,8 @@ def main():
                 val_targets.append(targets)
         val_pred = torch.cat(val_preds, dim=0)
         val_true = torch.cat(val_targets, dim=0)
-        med_km, mean_km = median_geodesic_km(val_pred, val_true)
-        print(f"  Epoch {epoch + 1}/{args.epochs}  Val median geodesic: {med_km:.4f} km  mean: {mean_km:.4f} km")
+        med_score, mean_score = median_geoguessr_score(val_pred, val_true)
+        print(f"  Epoch {epoch + 1}/{args.epochs}  Val median GeoGuessr score: {med_score:.2f}  mean: {mean_score:.2f}")
 
     # Final test
     model.eval()
@@ -224,9 +235,9 @@ def main():
             test_targets.append(targets)
     test_pred = torch.cat(test_preds, dim=0)
     test_true = torch.cat(test_targets, dim=0)
-    test_med, test_mean = median_geodesic_km(test_pred, test_true)
-    print(f"\nFinal test median geodesic distance: {test_med:.4f} km")
-    print(f"Final test mean geodesic distance:   {test_mean:.4f} km")
+    test_med, test_mean = median_geoguessr_score(test_pred, test_true)
+    print(f"\nFinal test median GeoGuessr score: {test_med:.2f}")
+    print(f"Final test mean GeoGuessr score:   {test_mean:.2f}")
 
 
 if __name__ == "__main__":
