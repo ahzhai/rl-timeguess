@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import random
+import time
 from dataclasses import dataclass
 from typing import List, Tuple
 
@@ -24,9 +25,8 @@ import torch.nn.functional as F
 from baseline.train_baseline_CNN import (
     RANDOM_SEED,
     build_path,
-    haversine_km,
     load_metadata,
-    median_geodesic_km,
+    median_geoguessr_score,
 )
 from rl_explore.rl_env import GeoPanningEnv
 from rl_explore.rl_policy import RLGeoPolicy
@@ -57,10 +57,10 @@ def rollout(
     steps_per_batch: int,
     gamma: float,
     device: torch.device,
-) -> Tuple[List[Transition], List[float]]:
+) -> Tuple[List[Transition], List[float], int]:
     """
     Collect a batch of transitions using the current policy.
-    Returns transitions and list of episode returns.
+    Returns transitions, list of episode returns, and count of terminate actions.
     """
     policy.eval()
     transitions: List[Transition] = []
@@ -69,6 +69,7 @@ def rollout(
     obs = env.reset()
     ep_ret = 0.0
     steps_collected = 0
+    n_terminates = 0  # count terminate actions for progress
 
     while steps_collected < steps_per_batch:
         obs_batch = obs.unsqueeze(0)  # (1, C, H, W)
@@ -83,6 +84,7 @@ def rollout(
         # For terminate, pass predicted coords into env.step so it can compute reward.
         if action_int == env.ACTION_TERMINATE:
             next_obs, reward, done, info = env.step(action_int, pred_coords)
+            n_terminates += 1
         else:
             next_obs, reward, done, info = env.step(action_int)
 
@@ -101,6 +103,9 @@ def rollout(
         )
         steps_collected += 1
 
+        if steps_collected % 512 == 0 and steps_collected < steps_per_batch:
+            print(f"    rollout progress: {steps_collected}/{steps_per_batch} steps, {len(episode_returns)} episodes done", flush=True)
+
         if done:
             episode_returns.append(ep_ret)
             obs = env.reset()
@@ -108,7 +113,7 @@ def rollout(
         else:
             obs = next_obs
 
-    return transitions, episode_returns
+    return transitions, episode_returns, n_terminates
 
 
 def compute_gae(
@@ -169,21 +174,27 @@ def ppo_update(
     policy.train()
     n = obs_batch.size(0)
     indices = torch.arange(n)
+    n_minibatches = (n + minibatch_size - 1) // minibatch_size
+    print(f"    PPO update: n={n}, epochs={epochs}, minibatches={n_minibatches} (size {minibatch_size})", flush=True)
 
     last_pi_loss, last_v_loss, last_ent = 0.0, 0.0, 0.0
 
-    for _ in range(epochs):
+    for ppo_epoch in range(epochs):
+        t_epoch_start = time.perf_counter()
         perm = indices[torch.randperm(n)]
-        for start in range(0, n, minibatch_size):
+        for mb_i, start in enumerate(range(0, n, minibatch_size)):
             end = min(start + minibatch_size, n)
             mb_idx = perm[start:end]
 
+            t0 = time.perf_counter()
             obs_mb = obs_batch[mb_idx].to(device)
             act_mb = actions_batch[mb_idx].to(device)
             logp_old_mb = logp_old_batch[mb_idx].to(device)
             ret_mb = returns_batch[mb_idx].to(device)
             adv_mb = adv_batch[mb_idx].to(device)
+            t_to = time.perf_counter() - t0
 
+            t_fwd = time.perf_counter()
             logits, value, _ = policy(obs_mb)
             dist = torch.distributions.Categorical(logits=logits)
             logp = dist.log_prob(act_mb)
@@ -197,15 +208,26 @@ def ppo_update(
             value_loss = F.mse_loss(value, ret_mb)
 
             loss = policy_loss + vf_coef * value_loss - ent_coef * entropy
+            t_fwd = time.perf_counter() - t_fwd
 
+            t_bwd = time.perf_counter()
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=0.5)
             optimizer.step()
+            t_bwd = time.perf_counter() - t_bwd
 
             last_pi_loss = float(policy_loss.item())
             last_v_loss = float(value_loss.item())
             last_ent = float(entropy.item())
+
+            print(
+                f"      mb {mb_i + 1}/{n_minibatches} | to_device={t_to:.2f}s forward={t_fwd:.2f}s backward={t_bwd:.2f}s",
+                flush=True,
+            )
+
+        t_epoch = time.perf_counter() - t_epoch_start
+        print(f"    PPO epoch {ppo_epoch + 1}/{epochs} done in {t_epoch:.1f}s", flush=True)
 
     return last_pi_loss, last_v_loss, last_ent
 
@@ -216,7 +238,7 @@ def evaluate_policy(
     device: torch.device,
     max_steps: int = 10,
 ) -> Tuple[float, float]:
-    """Run greedy evaluation on a subset of samples and report median/mean distance."""
+    """Run greedy evaluation on a subset of samples and report median/mean GeoGuessr score (higher is better)."""
     policy.eval()
     env = GeoPanningEnv(samples, max_steps=max_steps, device=device)
 
@@ -251,8 +273,8 @@ def evaluate_policy(
         return float("nan"), float("nan")
     pred_tensor = torch.stack(preds, dim=0)
     true_tensor = torch.stack(trues, dim=0)
-    med_km, mean_km = median_geodesic_km(pred_tensor, true_tensor)
-    return med_km, mean_km
+    med_score, mean_score = median_geoguessr_score(pred_tensor, true_tensor)
+    return med_score, mean_score
 
 
 def main() -> None:
@@ -302,6 +324,7 @@ def main() -> None:
     if not samples:
         raise SystemExit("No samples found. Check --metadata and --data_root.")
     print(f"Total samples: {len(samples)}")
+    print("(Typical runtime: ~2–8 min per epoch on GPU/MPS, ~10–20 min on CPU for default steps_per_batch=2048)")
 
     # 80/10/10 split as in baseline.
     n = len(samples)
@@ -334,14 +357,35 @@ def main() -> None:
         lr=args.lr,
     )
 
+    print(f"  Train: {len(train_samples)} | Val: {len(val_samples)} | Test: {len(test_samples)}")
+    print(f"  Rollout: {args.steps_per_batch} steps/batch | max_steps/episode: {args.max_steps}")
+    print(f"  Epochs: {args.epochs} | PPO epochs: {args.ppo_epochs} | minibatch: {args.minibatch_size}")
+    print()
+
     for epoch in range(1, args.epochs + 1):
-        transitions, ep_returns = rollout(env, policy, args.steps_per_batch, args.gamma, device)
+        t_epoch_start = time.perf_counter()
+
+        t_rollout_start = time.perf_counter()
+        transitions, ep_returns, n_terminates = rollout(
+            env, policy, args.steps_per_batch, args.gamma, device
+        )
+        t_rollout = time.perf_counter() - t_rollout_start
+        steps_per_sec = args.steps_per_batch / t_rollout if t_rollout > 0 else 0
+        print(
+            f"Epoch {epoch}/{args.epochs} | Rollout: {t_rollout:.1f}s ({steps_per_sec:.0f} steps/s) | "
+            f"episodes: {len(ep_returns)} | terminates: {n_terminates}"
+        )
+
+        t_gae_start = time.perf_counter()
         obs_b, act_b, logp_b, ret_b, adv_b = compute_gae(
             transitions,
             gamma=args.gamma,
             lam=args.gae_lambda,
         )
+        t_gae = time.perf_counter() - t_gae_start
+        print(f"  GAE: {t_gae:.2f}s")
 
+        t_ppo_start = time.perf_counter()
         pi_loss, v_loss, ent = ppo_update(
             policy,
             optimizer,
@@ -357,31 +401,40 @@ def main() -> None:
             minibatch_size=args.minibatch_size,
             device=device,
         )
+        t_ppo = time.perf_counter() - t_ppo_start
+        print(f"  PPO update: {t_ppo:.1f}s")
 
         avg_ret = sum(ep_returns) / max(1, len(ep_returns))
         print(
-            f"Epoch {epoch}/{args.epochs} | "
-            f"episodes={len(ep_returns)} | "
-            f"avg_return={avg_ret:.3f} | "
-            f"pi_loss={pi_loss:.4f} | v_loss={v_loss:.4f} | ent={ent:.3f}"
+            f"  Losses: pi={pi_loss:.4f} | v={v_loss:.4f} | ent={ent:.3f} | avg_return={avg_ret:.3f}"
         )
 
         # Periodic evaluation on validation set (subset for speed).
         if val_samples:
+            t_eval_start = time.perf_counter()
             subset = val_samples[: min(512, len(val_samples))]
-            med_km, mean_km = evaluate_policy(subset, policy, device, max_steps=args.max_steps)
+            med_score, mean_score = evaluate_policy(subset, policy, device, max_steps=args.max_steps)
+            t_eval = time.perf_counter() - t_eval_start
             print(
-                f"  Val median geodesic: {med_km:.2f} km | "
-                f"mean: {mean_km:.2f} km"
+                f"  Val median GeoGuessr score: {med_score:.2f} | mean: {mean_score:.2f} (higher is better) [{t_eval:.1f}s]"
             )
+
+        t_epoch = time.perf_counter() - t_epoch_start
+        remaining_epochs = args.epochs - epoch
+        eta = t_epoch * remaining_epochs if remaining_epochs > 0 else 0
+        print(f"  Epoch time: {t_epoch:.1f}s | ETA: {eta/60:.1f} min remaining")
+        print()
 
     # Final evaluation on test set.
     if test_samples:
+        print("\nRunning final test evaluation ...")
+        t_test_start = time.perf_counter()
         subset = test_samples[: min(1024, len(test_samples))]
-        med_km, mean_km = evaluate_policy(subset, policy, device, max_steps=args.max_steps)
-        print("\nFinal test performance:")
-        print(f"  Median geodesic distance: {med_km:.2f} km")
-        print(f"  Mean geodesic distance:   {mean_km:.2f} km")
+        med_score, mean_score = evaluate_policy(subset, policy, device, max_steps=args.max_steps)
+        t_test = time.perf_counter() - t_test_start
+        print(f"Final test ({t_test:.1f}s) — higher is better:")
+        print(f"  Median GeoGuessr score: {med_score:.2f}")
+        print(f"  Mean GeoGuessr score:   {mean_score:.2f}")
 
 
 if __name__ == "__main__":

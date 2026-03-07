@@ -177,16 +177,18 @@ def main():
     val_ds = GeoDataset(val_samples, transform=get_transform(train=False))
     test_ds = GeoDataset(test_samples, transform=get_transform(train=False))
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0, pin_memory=True)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0, pin_memory=False)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
 
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
-        device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
+    # if torch.cuda.is_available():
+    #     device = torch.device("cuda")
+    # elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+    #     device = torch.device("mps")
+    # else:
+    #     device = torch.device("cpu")
+    device = torch.device("cpu")
+
     print(f"Using device: {device}")
     print(f"Backbone: {args.backbone}")
     model = CNNGeo(backbone_name=args.backbone).to(device)

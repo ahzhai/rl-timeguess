@@ -8,7 +8,6 @@ We keep this self-contained (no gym dependency) and use tensors directly in the 
 
 from __future__ import annotations
 
-import math
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,7 +21,7 @@ from baseline.train_baseline_CNN import (
     IMG_SIZE,
     IMAGENET_MEAN,
     IMAGENET_STD,
-    haversine_km,
+    geoguessr_score,
 )
 
 
@@ -75,7 +74,7 @@ class GeoPanningEnv:
             samples: list of (path, lat, lon).
             max_steps: maximum steps before forced termination.
             step_penalty: per-move negative reward.
-            alpha: reward scale for terminal distance penalty.
+            alpha: reward scale for terminal GeoGuessr score (reward = alpha * score/5000; higher score = higher reward).
             pan_frac: fraction of image dimension to move per pan action.
             zoom_levels: relative crop size levels; smaller => more zoom.
             device: device to put tensors on.
@@ -156,11 +155,11 @@ class GeoPanningEnv:
                 raise ValueError("pred_latlon must be provided for terminate action.")
             pred_lat = float(pred_latlon[0].item())
             pred_lon = float(pred_latlon[1].item())
-            dist_km = haversine_km(pred_lat, pred_lon, self._lat, self._lon)
-            # Log-scaled distance penalty.
-            reward = -self.alpha * math.log1p(dist_km)
+            # GeoGuessr score in [0, 5000]; higher is better -> positive reward.
+            score = geoguessr_score(pred_lat, pred_lon, self._lat, self._lon)
+            reward = self.alpha * (score / 5000.0)
             done = True
-            info["dist_km"] = dist_km
+            info["geoguessr_score"] = score
             info["true_lat"] = self._lat
             info["true_lon"] = self._lon
             info["pred_lat"] = pred_lat
