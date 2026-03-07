@@ -41,6 +41,7 @@ class Transition:
     reward: float
     done: bool
     pred_coords: torch.Tensor
+    agg_embedding: torch.Tensor  # aggregated past embeddings (for history); (1, embed_dim)
 
 
 def select_device() -> torch.device:
@@ -49,6 +50,14 @@ def select_device() -> torch.device:
     if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
+
+
+def _aggregate_history(buffer: list, device: torch.device, embed_dim: int) -> torch.Tensor:
+    """Aggregate buffer of (embed_dim,) tensors via mean. Returns (1, embed_dim)."""
+    if not buffer:
+        return torch.zeros(1, embed_dim, device=device)
+    stacked = torch.stack(buffer, dim=0)
+    return stacked.mean(dim=0, keepdim=True)
 
 
 def rollout(
@@ -60,11 +69,16 @@ def rollout(
 ) -> Tuple[List[Transition], List[float]]:
     """
     Collect a batch of transitions using the current policy.
+    When policy.history_len > 0, maintains a buffer of last K embeddings and passes
+    their mean as agg_embedding. Buffer is cleared on episode end.
     Returns transitions and list of episode returns.
     """
     policy.eval()
     transitions: List[Transition] = []
     episode_returns: List[float] = []
+    embed_dim = policy.embed_dim
+    history_len = policy.history_len
+    buffer: List[torch.Tensor] = []
 
     obs = env.reset()
     ep_ret = 0.0
@@ -72,7 +86,8 @@ def rollout(
 
     while steps_collected < steps_per_batch:
         obs_batch = obs.unsqueeze(0)  # (1, C, H, W)
-        logits, value, coords = policy(obs_batch)
+        agg = _aggregate_history(buffer, device, embed_dim) if history_len > 0 else None
+        logits, value, coords = policy(obs_batch, agg_embedding=agg)
         dist = torch.distributions.Categorical(logits=logits)
         action = dist.sample()
         logp = dist.log_prob(action)
@@ -88,6 +103,12 @@ def rollout(
 
         ep_ret += reward
 
+        # Store agg used for this step (for PPO); use zeros when history disabled.
+        stored_agg = (
+            _aggregate_history(buffer, device, embed_dim).to(device)
+            if history_len > 0
+            else torch.zeros(1, embed_dim, device=device)
+        )
         transitions.append(
             Transition(
                 obs=obs.to(device),
@@ -97,14 +118,23 @@ def rollout(
                 reward=float(reward),
                 done=done,
                 pred_coords=pred_coords.detach().to(device),
+                agg_embedding=stored_agg,
             )
         )
         steps_collected += 1
+
+        # Append current embedding to buffer (for next step), keep last history_len.
+        if history_len > 0:
+            emb = policy.encode(obs_batch).squeeze(0).detach()
+            buffer.append(emb)
+            if len(buffer) > history_len:
+                buffer.pop(0)
 
         if done:
             episode_returns.append(ep_ret)
             obs = env.reset()
             ep_ret = 0.0
+            buffer = []
         else:
             obs = next_obs
 
@@ -141,19 +171,21 @@ def compute_gae(
     returns = advantages + values_tensor
 
     obs_batch = torch.stack([t.obs for t in transitions], dim=0)
+    agg_batch = torch.cat([t.agg_embedding for t in transitions], dim=0)
     actions_batch = torch.tensor([t.action for t in transitions], dtype=torch.long)
     logp_batch = torch.tensor([t.logp for t in transitions], dtype=torch.float32)
 
     # Normalize advantages for stability.
     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-    return obs_batch, actions_batch, logp_batch, returns, advantages
+    return obs_batch, agg_batch, actions_batch, logp_batch, returns, advantages
 
 
 def ppo_update(
     policy: RLGeoPolicy,
     optimizer: torch.optim.Optimizer,
     obs_batch: torch.Tensor,
+    agg_batch: torch.Tensor,
     actions_batch: torch.Tensor,
     logp_old_batch: torch.Tensor,
     returns_batch: torch.Tensor,
@@ -179,12 +211,13 @@ def ppo_update(
             mb_idx = perm[start:end]
 
             obs_mb = obs_batch[mb_idx].to(device)
+            agg_mb = agg_batch[mb_idx].to(device)
             act_mb = actions_batch[mb_idx].to(device)
             logp_old_mb = logp_old_batch[mb_idx].to(device)
             ret_mb = returns_batch[mb_idx].to(device)
             adv_mb = adv_batch[mb_idx].to(device)
 
-            logits, value, _ = policy(obs_mb)
+            logits, value, _ = policy(obs_mb, agg_embedding=agg_mb)
             dist = torch.distributions.Categorical(logits=logits)
             logp = dist.log_prob(act_mb)
             entropy = dist.entropy().mean()
@@ -219,6 +252,8 @@ def evaluate_policy(
     """Run greedy evaluation on a subset of samples and report median/mean distance."""
     policy.eval()
     env = GeoPanningEnv(samples, max_steps=max_steps, device=device)
+    embed_dim = policy.embed_dim
+    history_len = policy.history_len
 
     preds = []
     trues = []
@@ -226,16 +261,28 @@ def evaluate_policy(
     with torch.no_grad():
         for sample in samples:
             obs = env.reset()
+            buffer: List[torch.Tensor] = []
             done = False
             steps = 0
             while not done and steps < max_steps:
                 obs_b = obs.unsqueeze(0)
-                logits, _, coords = policy(obs_b)
+                agg = (
+                    _aggregate_history(buffer, device, embed_dim)
+                    if history_len > 0
+                    else None
+                )
+                logits, _, coords = policy(obs_b, agg_embedding=agg)
                 dist = torch.distributions.Categorical(logits=logits)
                 # Greedy action for eval.
                 action = torch.argmax(dist.logits, dim=-1)
                 action_int = int(action.item())
                 pred_coords = coords[0]
+
+                if history_len > 0:
+                    emb = policy.encode(obs_b).squeeze(0)
+                    buffer.append(emb)
+                    if len(buffer) > history_len:
+                        buffer.pop(0)
 
                 if action_int == env.ACTION_TERMINATE or steps == max_steps - 1:
                     # Force termination at last step.
@@ -291,6 +338,12 @@ def main() -> None:
     parser.add_argument("--max_steps", type=int, default=10)
     parser.add_argument("--step_penalty", type=float, default=0.01)
     parser.add_argument("--alpha", type=float, default=1.0)
+    parser.add_argument(
+        "--history_len",
+        type=int,
+        default=5,
+        help="Number of past embeddings to aggregate (0 = no history).",
+    )
 
     args = parser.parse_args()
 
@@ -327,6 +380,7 @@ def main() -> None:
         checkpoint_path=args.baseline_checkpoint or None,
         num_actions=7,
         hidden_dim=0,
+        history_len=args.history_len,
         device=device,
     ).to(device)
     optimizer = torch.optim.Adam(
@@ -336,7 +390,7 @@ def main() -> None:
 
     for epoch in range(1, args.epochs + 1):
         transitions, ep_returns = rollout(env, policy, args.steps_per_batch, args.gamma, device)
-        obs_b, act_b, logp_b, ret_b, adv_b = compute_gae(
+        obs_b, agg_b, act_b, logp_b, ret_b, adv_b = compute_gae(
             transitions,
             gamma=args.gamma,
             lam=args.gae_lambda,
@@ -346,6 +400,7 @@ def main() -> None:
             policy,
             optimizer,
             obs_b,
+            agg_b,
             act_b,
             logp_b,
             ret_b,

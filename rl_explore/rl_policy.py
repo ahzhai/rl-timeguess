@@ -7,6 +7,10 @@ and add:
   - policy head over discrete actions
   - value head
   - coordinate regression head (for terminate predictions)
+
+Optional: embedding aggregation over the last K observations (history_len > 0).
+Current observation embedding is concatenated with aggregated past embeddings
+and projected before the policy/value/coord heads.
 """
 
 from __future__ import annotations
@@ -24,6 +28,7 @@ class RLGeoPolicy(nn.Module):
     Minimal actor-critic model:
 
       crop -> frozen CNN backbone -> feature
+           -> [optional: concat with aggregated history -> project]
            -> policy logits over actions
            -> state value
            -> (lat, lon) regression for terminate
@@ -35,10 +40,12 @@ class RLGeoPolicy(nn.Module):
         checkpoint_path: Optional[str] = None,
         num_actions: int = 7,
         hidden_dim: int = 0,
+        history_len: int = 0,
         device: Optional[torch.device] = None,
     ) -> None:
         super().__init__()
         self.device = device or torch.device("cpu")
+        self.history_len = max(0, history_len)
 
         # Build baseline CNN and optionally load checkpoint weights.
         cnn = CNNGeo(backbone_name=backbone_name, pretrained=True)
@@ -69,22 +76,39 @@ class RLGeoPolicy(nn.Module):
             self.encoder_head = None
             policy_input_dim = feat_dim
 
+        self.embed_dim = policy_input_dim
+
+        # When using history, concat [current_emb, agg_emb] and project back to policy_input_dim.
+        if self.history_len > 0:
+            self.combine_proj = nn.Sequential(
+                nn.Linear(2 * policy_input_dim, policy_input_dim),
+                nn.ReLU(inplace=True),
+            )
+        else:
+            self.combine_proj = None
+
         self.policy_head = nn.Linear(policy_input_dim, num_actions)
         self.value_head = nn.Linear(policy_input_dim, 1)
         self.coord_head = nn.Linear(policy_input_dim, 2)
 
     def encode(self, obs: torch.Tensor) -> torch.Tensor:
-        """Run crop through backbone (no gradients on backbone)."""
+        """Run crop through backbone (no gradients on backbone). Returns (B, embed_dim)."""
         with torch.no_grad():
             feat = self.backbone(obs)
         if self.encoder_head is not None:
             feat = self.encoder_head(feat)
         return feat
 
-    def forward(self, obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        obs: torch.Tensor,
+        agg_embedding: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
             obs: (B, 3, H, W) tensor.
+            agg_embedding: optional (B, embed_dim) aggregated history. If history_len > 0
+                and None, zeros are used. Ignored when history_len == 0.
 
         Returns:
             logits: (B, num_actions)
@@ -92,6 +116,13 @@ class RLGeoPolicy(nn.Module):
             coords: (B, 2) predicted [lat, lon] in degrees
         """
         feat = self.encode(obs)
+        if self.history_len > 0:
+            if agg_embedding is None:
+                agg_embedding = torch.zeros(
+                    feat.size(0), self.embed_dim, device=feat.device, dtype=feat.dtype
+                )
+            combined = torch.cat([feat, agg_embedding], dim=-1)
+            feat = self.combine_proj(combined)
         logits = self.policy_head(feat)
         value = self.value_head(feat)
         coords = self.coord_head(feat)
