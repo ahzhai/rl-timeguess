@@ -34,15 +34,16 @@ from rl_explore.rl_policy import RLGeoPolicy
 
 @dataclass
 class Transition:
-    """obs is the aggregated context vector (mean-pooled embeddings) for PPO."""
-    obs: torch.Tensor  # (1, feat_dim) aggregated embedding
+    """embedding_sequence (1, max_steps, D), mask (1, max_steps) for PPO."""
+    embedding_sequence: torch.Tensor
+    mask: torch.Tensor
     action: int
     logp: float
     value: float
     reward: float
     done: bool
     pred_coords: torch.Tensor
-    true_coords: Optional[torch.Tensor] = None  # (2,) [lat, lon] only when action == terminate
+    true_coords: Optional[torch.Tensor] = None
 
 
 def select_device() -> torch.device:
@@ -59,12 +60,9 @@ def rollout(
     steps_per_batch: int,
     gamma: float,
     device: torch.device,
+    max_steps: int,
 ) -> Tuple[List[Transition], List[float], int]:
-    """
-    Collect a batch of transitions using the current policy.
-    Maintains per-episode embedding history; aggregates via mean pooling for each step.
-    Returns transitions, list of episode returns, and count of terminate actions.
-    """
+    """Collect transitions; aggregate embeddings with attention (sequence + mask)."""
     policy.eval()
     transitions: List[Transition] = []
     episode_returns: List[float] = []
@@ -73,17 +71,21 @@ def rollout(
     current_episode_embeddings: List[torch.Tensor] = []
     ep_ret = 0.0
     steps_collected = 0
-    n_terminates = 0  # count terminate actions for progress
+    n_terminates = 0
 
     while steps_collected < steps_per_batch:
-        # Encode current crop once (frozen backbone) and append to history.
-        obs_batch = obs.unsqueeze(0).to(device)  # (1, C, H, W)
-        emb = policy.encode(obs_batch)  # (1, feat_dim)
+        obs_batch = obs.unsqueeze(0).to(device)
+        emb = policy.encode(obs_batch)
         current_episode_embeddings.append(emb.detach())
 
-        # Mean-pool all embeddings seen so far and pass to policy.
-        aggregated_state = policy.aggregate_embeddings(current_episode_embeddings)  # (1, feat_dim)
-        logits, value, coords = policy(aggregated_state)
+        T = len(current_episode_embeddings)
+        stacked = torch.stack(current_episode_embeddings, dim=1)
+        padded = torch.zeros(1, max_steps, stacked.shape[2], device=device, dtype=stacked.dtype)
+        padded[:, :T] = stacked
+        mask = torch.zeros(1, max_steps, device=device, dtype=torch.float32)
+        mask[:, :T] = 1.0
+
+        logits, value, coords = policy(padded, mask)
         dist = torch.distributions.Categorical(logits=logits)
         action = dist.sample()
         logp = dist.log_prob(action)
@@ -91,7 +93,6 @@ def rollout(
         action_int = int(action.item())
         pred_coords = coords[0]
 
-        # For terminate, pass predicted coords into env.step so it can compute reward.
         if action_int == env.ACTION_TERMINATE:
             next_obs, reward, done, info = env.step(action_int, pred_coords)
             n_terminates += 1
@@ -104,10 +105,10 @@ def rollout(
 
         ep_ret += reward
 
-        # Store aggregated context (pooled embedding) for PPO updates.
         transitions.append(
             Transition(
-                obs=aggregated_state.detach().to(device),
+                embedding_sequence=padded.detach().to(device),
+                mask=mask.to(device),
                 action=action_int,
                 logp=float(logp.item()),
                 value=float(value.item()),
@@ -138,10 +139,10 @@ def compute_gae(
     gamma: float,
     lam: float,
     action_terminate: int = 6,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute advantages and returns with GAE.
-    Outputs tensors for obs, actions, old_logp, returns, advantages, terminate_mask, true_coords.
+    Returns embedding_sequences_batch, masks_batch, actions, logp, returns, advantages, terminate_mask, true_coords_batch.
     """
     rewards = [t.reward for t in transitions]
     values = [t.value for t in transitions]
@@ -163,8 +164,8 @@ def compute_gae(
 
     returns = advantages + values_tensor
 
-    # Each t.obs is (1, feat_dim); concatenate to (N, feat_dim).
-    obs_batch = torch.cat([t.obs for t in transitions], dim=0)
+    embedding_sequences_batch = torch.cat([t.embedding_sequence for t in transitions], dim=0)
+    masks_batch = torch.cat([t.mask for t in transitions], dim=0)
     actions_batch = torch.tensor([t.action for t in transitions], dtype=torch.long)
     logp_batch = torch.tensor([t.logp for t in transitions], dtype=torch.float32)
 
@@ -183,13 +184,14 @@ def compute_gae(
     # Normalize advantages for stability.
     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-    return obs_batch, actions_batch, logp_batch, returns, advantages, terminate_mask, true_coords_batch
+    return embedding_sequences_batch, masks_batch, actions_batch, logp_batch, returns, advantages, terminate_mask, true_coords_batch
 
 
 def ppo_update(
     policy: RLGeoPolicy,
     optimizer: torch.optim.Optimizer,
-    obs_batch: torch.Tensor,
+    embedding_sequences_batch: torch.Tensor,
+    masks_batch: torch.Tensor,
     actions_batch: torch.Tensor,
     logp_old_batch: torch.Tensor,
     returns_batch: torch.Tensor,
@@ -204,10 +206,9 @@ def ppo_update(
     minibatch_size: int,
     device: torch.device,
 ) -> Tuple[float, float, float, float]:
-    """Run several epochs of PPO updates over the collected batch.
-    Includes a regression loss on the coord head for terminate steps so GeoGuessr score can improve."""
+    """PPO update over batch; policy(seq, mask) for attention."""
     policy.train()
-    n = obs_batch.size(0)
+    n = embedding_sequences_batch.size(0)
     indices = torch.arange(n)
     n_minibatches = (n + minibatch_size - 1) // minibatch_size
     print(f"    PPO update: n={n}, epochs={epochs}, minibatches={n_minibatches} (size {minibatch_size})", flush=True)
@@ -222,7 +223,8 @@ def ppo_update(
             mb_idx = perm[start:end]
 
             t0 = time.perf_counter()
-            obs_mb = obs_batch[mb_idx].to(device)
+            seq_mb = embedding_sequences_batch[mb_idx].to(device)
+            mask_mb = masks_batch[mb_idx].to(device)
             act_mb = actions_batch[mb_idx].to(device)
             logp_old_mb = logp_old_batch[mb_idx].to(device)
             ret_mb = returns_batch[mb_idx].to(device)
@@ -232,7 +234,7 @@ def ppo_update(
             t_to = time.perf_counter() - t0
 
             t_fwd = time.perf_counter()
-            logits, value, coords = policy(obs_mb)
+            logits, value, coords = policy(seq_mb, mask_mb)
             dist = torch.distributions.Categorical(logits=logits)
             logp = dist.log_prob(act_mb)
             entropy = dist.entropy().mean()
@@ -281,8 +283,7 @@ def evaluate_policy(
     device: torch.device,
     max_steps: int = 10,
 ) -> Tuple[float, float]:
-    """Run greedy evaluation on a subset of samples and report median/mean GeoGuessr score (higher is better).
-    Uses the same embedding aggregation (mean pooling) as training."""
+    """Greedy eval; aggregate embeddings with attention (sequence + mask)."""
     policy.eval()
     env = GeoPanningEnv(samples, max_steps=max_steps, device=device)
 
@@ -296,21 +297,22 @@ def evaluate_policy(
             done = False
             steps = 0
             while not done and steps < max_steps:
-                # Encode current crop and append to history.
                 obs_b = obs.unsqueeze(0).to(device)
                 emb = policy.encode(obs_b)
                 embedding_history.append(emb)
-                # Aggregate and pass to policy.
-                context = policy.aggregate_embeddings(embedding_history)
-                logits, _, coords = policy(context)
+                T = len(embedding_history)
+                stacked = torch.stack(embedding_history, dim=1)
+                padded = torch.zeros(1, max_steps, stacked.shape[2], device=device, dtype=stacked.dtype)
+                padded[:, :T] = stacked
+                mask = torch.zeros(1, max_steps, device=device, dtype=torch.float32)
+                mask[:, :T] = 1.0
+                logits, _, coords = policy(padded, mask)
                 dist = torch.distributions.Categorical(logits=logits)
-                # Greedy action for eval.
                 action = torch.argmax(dist.logits, dim=-1)
                 action_int = int(action.item())
                 pred_coords = coords[0]
 
                 if action_int == env.ACTION_TERMINATE or steps == max_steps - 1:
-                    # Force termination at last step.
                     _, _, _, info = env.step(env.ACTION_TERMINATE, pred_coords)
                     preds.append(pred_coords.cpu())
                     trues.append(torch.tensor([info["true_lat"], info["true_lon"]]))
@@ -423,7 +425,7 @@ def main() -> None:
 
         t_rollout_start = time.perf_counter()
         transitions, ep_returns, n_terminates = rollout(
-            env, policy, args.steps_per_batch, args.gamma, device
+            env, policy, args.steps_per_batch, args.gamma, device, max_steps=args.max_steps
         )
         t_rollout = time.perf_counter() - t_rollout_start
         steps_per_sec = args.steps_per_batch / t_rollout if t_rollout > 0 else 0
@@ -433,7 +435,7 @@ def main() -> None:
         )
 
         t_gae_start = time.perf_counter()
-        obs_b, act_b, logp_b, ret_b, adv_b, term_mask, true_coords_b = compute_gae(
+        seq_b, mask_b, act_b, logp_b, ret_b, adv_b, term_mask, true_coords_b = compute_gae(
             transitions,
             gamma=args.gamma,
             lam=args.gae_lambda,
@@ -445,7 +447,8 @@ def main() -> None:
         pi_loss, v_loss, ent, coord_loss = ppo_update(
             policy,
             optimizer,
-            obs_b,
+            seq_b,
+            mask_b,
             act_b,
             logp_b,
             ret_b,
