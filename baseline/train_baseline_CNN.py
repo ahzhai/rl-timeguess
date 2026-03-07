@@ -153,6 +153,7 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--samples_per_city", type=int, default=100)
     parser.add_argument("--backbone", type=str, default="resnet50", help="timm CNN model (e.g. resnet50, efficientnet_b0)")
+    parser.add_argument("--save", type=str, default="", help="Path to save checkpoint for RL (e.g. checkpoints/baseline_cnn.pt)")
     args = parser.parse_args()
 
     random.seed(RANDOM_SEED)
@@ -240,6 +241,11 @@ def main():
     test_med, test_mean = median_geoguessr_score(test_pred, test_true)
     print(f"\nFinal test median GeoGuessr score: {test_med:.2f}")
     print(f"Final test mean GeoGuessr score:   {test_mean:.2f}")
+
+    if args.save:
+        Path(args.save).parent.mkdir(parents=True, exist_ok=True)
+        torch.save({"model": model.state_dict()}, args.save)
+        print(f"Checkpoint saved to {args.save} (use with RL: --baseline_checkpoint {args.save})")
 
 
 if __name__ == "__main__":
