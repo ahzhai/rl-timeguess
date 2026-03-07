@@ -11,7 +11,7 @@ and add:
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -21,12 +21,15 @@ from baseline.train_baseline_CNN import CNNGeo
 
 class RLGeoPolicy(nn.Module):
     """
-    Minimal actor-critic model:
+    Actor-critic with Simple Embedding Aggregation (mean pooling).
 
-      crop -> frozen CNN backbone -> feature
-           -> policy logits over actions
-           -> state value
-           -> (lat, lon) regression for terminate
+    For each episode we maintain a history of backbone embeddings for all crops
+    seen so far. These are mean-pooled to form a single context vector, which
+    is passed to the policy, value, and coord heads.
+
+      crop -> frozen CNN backbone -> embedding (once per step)
+      list of embeddings -> mean pool -> context vector
+      context vector -> policy logits | value | (lat, lon)
     """
 
     def __init__(
@@ -74,27 +77,48 @@ class RLGeoPolicy(nn.Module):
         self.coord_head = nn.Linear(policy_input_dim, 2)
 
     def encode(self, obs: torch.Tensor) -> torch.Tensor:
-        """Run crop through backbone (no gradients on backbone)."""
+        """Run crop through backbone (no gradients on backbone). Returns (B, feat_dim)."""
         with torch.no_grad():
             feat = self.backbone(obs)
         if self.encoder_head is not None:
             feat = self.encoder_head(feat)
         return feat
 
-    def forward(self, obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def aggregate_embeddings(
+        self, list_of_embeddings: List[torch.Tensor]
+    ) -> torch.Tensor:
         """
+        Mean-pool a list of embeddings over the temporal dimension to form a
+        single context vector per batch item.
+
         Args:
-            obs: (B, 3, H, W) tensor.
+            list_of_embeddings: List of tensors, each (B, feat_dim) or (1, feat_dim).
+
+        Returns:
+            (B, feat_dim) tensor.
+        """
+        if not list_of_embeddings:
+            raise ValueError("aggregate_embeddings requires at least one embedding.")
+        stacked = torch.stack(list_of_embeddings, dim=0)
+        return torch.mean(stacked, dim=0)
+
+    def forward(
+        self, context: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Run actor, critic, and coord heads on an aggregated context vector.
+
+        Args:
+            context: (B, feat_dim) tensor — mean-pooled embeddings for the episode so far.
 
         Returns:
             logits: (B, num_actions)
-            value:  (B, 1)
+            value:  (B,)
             coords: (B, 2) predicted [lat, lon] in degrees
         """
-        feat = self.encode(obs)
-        logits = self.policy_head(feat)
-        value = self.value_head(feat)
-        coords = self.coord_head(feat)
+        logits = self.policy_head(context)
+        value = self.value_head(context)
+        coords = self.coord_head(context)
         return logits, value.squeeze(-1), coords
 
 

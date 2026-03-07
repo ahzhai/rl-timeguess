@@ -34,7 +34,8 @@ from rl_explore.rl_policy import RLGeoPolicy
 
 @dataclass
 class Transition:
-    obs: torch.Tensor
+    """obs is the aggregated context vector (mean-pooled embeddings) for PPO."""
+    obs: torch.Tensor  # (1, feat_dim) aggregated embedding
     action: int
     logp: float
     value: float
@@ -60,6 +61,7 @@ def rollout(
 ) -> Tuple[List[Transition], List[float], int]:
     """
     Collect a batch of transitions using the current policy.
+    Maintains per-episode embedding history; aggregates via mean pooling for each step.
     Returns transitions, list of episode returns, and count of terminate actions.
     """
     policy.eval()
@@ -67,13 +69,20 @@ def rollout(
     episode_returns: List[float] = []
 
     obs = env.reset()
+    current_episode_embeddings: List[torch.Tensor] = []
     ep_ret = 0.0
     steps_collected = 0
     n_terminates = 0  # count terminate actions for progress
 
     while steps_collected < steps_per_batch:
-        obs_batch = obs.unsqueeze(0)  # (1, C, H, W)
-        logits, value, coords = policy(obs_batch)
+        # Encode current crop once (frozen backbone) and append to history.
+        obs_batch = obs.unsqueeze(0).to(device)  # (1, C, H, W)
+        emb = policy.encode(obs_batch)  # (1, feat_dim)
+        current_episode_embeddings.append(emb.detach())
+
+        # Mean-pool all embeddings seen so far and pass to policy.
+        aggregated_state = policy.aggregate_embeddings(current_episode_embeddings)  # (1, feat_dim)
+        logits, value, coords = policy(aggregated_state)
         dist = torch.distributions.Categorical(logits=logits)
         action = dist.sample()
         logp = dist.log_prob(action)
@@ -90,9 +99,10 @@ def rollout(
 
         ep_ret += reward
 
+        # Store aggregated context (pooled embedding) for PPO updates.
         transitions.append(
             Transition(
-                obs=obs.to(device),
+                obs=aggregated_state.detach().to(device),
                 action=action_int,
                 logp=float(logp.item()),
                 value=float(value.item()),
@@ -109,6 +119,7 @@ def rollout(
         if done:
             episode_returns.append(ep_ret)
             obs = env.reset()
+            current_episode_embeddings = []
             ep_ret = 0.0
         else:
             obs = next_obs
@@ -145,7 +156,8 @@ def compute_gae(
 
     returns = advantages + values_tensor
 
-    obs_batch = torch.stack([t.obs for t in transitions], dim=0)
+    # Each t.obs is (1, feat_dim); concatenate to (N, feat_dim).
+    obs_batch = torch.cat([t.obs for t in transitions], dim=0)
     actions_batch = torch.tensor([t.action for t in transitions], dtype=torch.long)
     logp_batch = torch.tensor([t.logp for t in transitions], dtype=torch.float32)
 
@@ -238,7 +250,8 @@ def evaluate_policy(
     device: torch.device,
     max_steps: int = 10,
 ) -> Tuple[float, float]:
-    """Run greedy evaluation on a subset of samples and report median/mean GeoGuessr score (higher is better)."""
+    """Run greedy evaluation on a subset of samples and report median/mean GeoGuessr score (higher is better).
+    Uses the same embedding aggregation (mean pooling) as training."""
     policy.eval()
     env = GeoPanningEnv(samples, max_steps=max_steps, device=device)
 
@@ -248,11 +261,17 @@ def evaluate_policy(
     with torch.no_grad():
         for sample in samples:
             obs = env.reset()
+            embedding_history: List[torch.Tensor] = []
             done = False
             steps = 0
             while not done and steps < max_steps:
-                obs_b = obs.unsqueeze(0)
-                logits, _, coords = policy(obs_b)
+                # Encode current crop and append to history.
+                obs_b = obs.unsqueeze(0).to(device)
+                emb = policy.encode(obs_b)
+                embedding_history.append(emb)
+                # Aggregate and pass to policy.
+                context = policy.aggregate_embeddings(embedding_history)
+                logits, _, coords = policy(context)
                 dist = torch.distributions.Categorical(logits=logits)
                 # Greedy action for eval.
                 action = torch.argmax(dist.logits, dim=-1)
