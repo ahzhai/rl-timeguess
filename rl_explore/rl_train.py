@@ -17,7 +17,7 @@ import argparse
 import random
 import time
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -42,6 +42,7 @@ class Transition:
     reward: float
     done: bool
     pred_coords: torch.Tensor
+    true_coords: Optional[torch.Tensor] = None  # (2,) [lat, lon] only when action == terminate
 
 
 def select_device() -> torch.device:
@@ -94,8 +95,12 @@ def rollout(
         if action_int == env.ACTION_TERMINATE:
             next_obs, reward, done, info = env.step(action_int, pred_coords)
             n_terminates += 1
+            true_coords = torch.tensor(
+                [info["true_lat"], info["true_lon"]], dtype=torch.float32, device=device
+            )
         else:
             next_obs, reward, done, info = env.step(action_int)
+            true_coords = None
 
         ep_ret += reward
 
@@ -109,6 +114,7 @@ def rollout(
                 reward=float(reward),
                 done=done,
                 pred_coords=pred_coords.detach().to(device),
+                true_coords=true_coords,
             )
         )
         steps_collected += 1
@@ -131,10 +137,11 @@ def compute_gae(
     transitions: List[Transition],
     gamma: float,
     lam: float,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    action_terminate: int = 6,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute advantages and returns with GAE.
-    Outputs tensors for obs, actions, old_logp, returns, advantages.
+    Outputs tensors for obs, actions, old_logp, returns, advantages, terminate_mask, true_coords.
     """
     rewards = [t.reward for t in transitions]
     values = [t.value for t in transitions]
@@ -161,10 +168,22 @@ def compute_gae(
     actions_batch = torch.tensor([t.action for t in transitions], dtype=torch.long)
     logp_batch = torch.tensor([t.logp for t in transitions], dtype=torch.float32)
 
+    # For coord head: mask and targets for terminate steps only.
+    terminate_mask = torch.tensor(
+        [t.action == action_terminate for t in transitions], dtype=torch.bool
+    )
+    true_coords_list = []
+    for t in transitions:
+        if t.true_coords is not None:
+            true_coords_list.append(t.true_coords.cpu().to(torch.float32))
+        else:
+            true_coords_list.append(torch.zeros(2, dtype=torch.float32))
+    true_coords_batch = torch.stack(true_coords_list, dim=0)
+
     # Normalize advantages for stability.
     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-    return obs_batch, actions_batch, logp_batch, returns, advantages
+    return obs_batch, actions_batch, logp_batch, returns, advantages, terminate_mask, true_coords_batch
 
 
 def ppo_update(
@@ -175,21 +194,25 @@ def ppo_update(
     logp_old_batch: torch.Tensor,
     returns_batch: torch.Tensor,
     adv_batch: torch.Tensor,
+    terminate_mask: torch.Tensor,
+    true_coords_batch: torch.Tensor,
     clip_ratio: float,
     vf_coef: float,
     ent_coef: float,
+    coord_coef: float,
     epochs: int,
     minibatch_size: int,
     device: torch.device,
-) -> Tuple[float, float, float]:
-    """Run several epochs of PPO updates over the collected batch."""
+) -> Tuple[float, float, float, float]:
+    """Run several epochs of PPO updates over the collected batch.
+    Includes a regression loss on the coord head for terminate steps so GeoGuessr score can improve."""
     policy.train()
     n = obs_batch.size(0)
     indices = torch.arange(n)
     n_minibatches = (n + minibatch_size - 1) // minibatch_size
     print(f"    PPO update: n={n}, epochs={epochs}, minibatches={n_minibatches} (size {minibatch_size})", flush=True)
 
-    last_pi_loss, last_v_loss, last_ent = 0.0, 0.0, 0.0
+    last_pi_loss, last_v_loss, last_ent, last_coord_loss = 0.0, 0.0, 0.0, 0.0
 
     for ppo_epoch in range(epochs):
         t_epoch_start = time.perf_counter()
@@ -204,10 +227,12 @@ def ppo_update(
             logp_old_mb = logp_old_batch[mb_idx].to(device)
             ret_mb = returns_batch[mb_idx].to(device)
             adv_mb = adv_batch[mb_idx].to(device)
+            term_mb = terminate_mask[mb_idx].to(device)
+            true_coords_mb = true_coords_batch[mb_idx].to(device)
             t_to = time.perf_counter() - t0
 
             t_fwd = time.perf_counter()
-            logits, value, _ = policy(obs_mb)
+            logits, value, coords = policy(obs_mb)
             dist = torch.distributions.Categorical(logits=logits)
             logp = dist.log_prob(act_mb)
             entropy = dist.entropy().mean()
@@ -219,7 +244,12 @@ def ppo_update(
 
             value_loss = F.mse_loss(value, ret_mb)
 
-            loss = policy_loss + vf_coef * value_loss - ent_coef * entropy
+            # Train coord head on terminate steps so validation GeoGuessr score can improve.
+            coord_loss = torch.tensor(0.0, device=device)
+            if term_mb.any():
+                coord_loss = F.smooth_l1_loss(coords[term_mb], true_coords_mb[term_mb])
+
+            loss = policy_loss + vf_coef * value_loss - ent_coef * entropy + coord_coef * coord_loss
             t_fwd = time.perf_counter() - t_fwd
 
             t_bwd = time.perf_counter()
@@ -232,6 +262,7 @@ def ppo_update(
             last_pi_loss = float(policy_loss.item())
             last_v_loss = float(value_loss.item())
             last_ent = float(entropy.item())
+            last_coord_loss = float(coord_loss.item()) if term_mb.any() else 0.0
 
             print(
                 f"      mb {mb_i + 1}/{n_minibatches} | to_device={t_to:.2f}s forward={t_fwd:.2f}s backward={t_bwd:.2f}s",
@@ -241,7 +272,7 @@ def ppo_update(
         t_epoch = time.perf_counter() - t_epoch_start
         print(f"    PPO epoch {ppo_epoch + 1}/{epochs} done in {t_epoch:.1f}s", flush=True)
 
-    return last_pi_loss, last_v_loss, last_ent
+    return last_pi_loss, last_v_loss, last_ent, last_coord_loss
 
 
 def evaluate_policy(
@@ -332,6 +363,12 @@ def main() -> None:
     parser.add_argument("--max_steps", type=int, default=10)
     parser.add_argument("--step_penalty", type=float, default=0.01)
     parser.add_argument("--alpha", type=float, default=1.0)
+    parser.add_argument(
+        "--coord_coef",
+        type=float,
+        default=0.5,
+        help="Coefficient for coord regression loss on terminate steps (trains the location head).",
+    )
 
     args = parser.parse_args()
 
@@ -396,7 +433,7 @@ def main() -> None:
         )
 
         t_gae_start = time.perf_counter()
-        obs_b, act_b, logp_b, ret_b, adv_b = compute_gae(
+        obs_b, act_b, logp_b, ret_b, adv_b, term_mask, true_coords_b = compute_gae(
             transitions,
             gamma=args.gamma,
             lam=args.gae_lambda,
@@ -405,7 +442,7 @@ def main() -> None:
         print(f"  GAE: {t_gae:.2f}s")
 
         t_ppo_start = time.perf_counter()
-        pi_loss, v_loss, ent = ppo_update(
+        pi_loss, v_loss, ent, coord_loss = ppo_update(
             policy,
             optimizer,
             obs_b,
@@ -413,9 +450,12 @@ def main() -> None:
             logp_b,
             ret_b,
             adv_b,
+            term_mask,
+            true_coords_b,
             clip_ratio=args.clip_ratio,
             vf_coef=args.vf_coef,
             ent_coef=args.ent_coef,
+            coord_coef=args.coord_coef,
             epochs=args.ppo_epochs,
             minibatch_size=args.minibatch_size,
             device=device,
@@ -425,7 +465,7 @@ def main() -> None:
 
         avg_ret = sum(ep_returns) / max(1, len(ep_returns))
         print(
-            f"  Losses: pi={pi_loss:.4f} | v={v_loss:.4f} | ent={ent:.3f} | avg_return={avg_ret:.3f}"
+            f"  Losses: pi={pi_loss:.4f} | v={v_loss:.4f} | ent={ent:.3f} | coord={coord_loss:.4f} | avg_return={avg_ret:.3f}"
         )
 
         # Periodic evaluation on validation set (subset for speed).
