@@ -22,7 +22,7 @@ from baseline.train_baseline_CNN import (
     IMG_SIZE,
     IMAGENET_MEAN,
     IMAGENET_STD,
-    haversine_km,
+    geoguessr_score,
 )
 
 
@@ -156,11 +156,11 @@ class GeoPanningEnv:
                 raise ValueError("pred_latlon must be provided for terminate action.")
             pred_lat = float(pred_latlon[0].item())
             pred_lon = float(pred_latlon[1].item())
-            dist_km = haversine_km(pred_lat, pred_lon, self._lat, self._lon)
-            # Log-scaled distance penalty.
-            reward = -self.alpha * math.log1p(dist_km)
+            # GeoGuessr-style reward in [0, 5000] (same as baseline) for comparable metrics.
+            score = geoguessr_score(pred_lat, pred_lon, self._lat, self._lon)
+            reward = score
             done = True
-            info["dist_km"] = dist_km
+            info["geoguessr_score"] = score
             info["true_lat"] = self._lat
             info["true_lon"] = self._lon
             info["pred_lat"] = pred_lat

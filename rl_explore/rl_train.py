@@ -23,10 +23,8 @@ import torch.nn.functional as F
 
 from baseline.train_baseline_CNN import (
     RANDOM_SEED,
-    build_path,
-    haversine_km,
     load_metadata,
-    median_geodesic_km,
+    median_geoguessr_score,
 )
 from rl_explore.rl_env import GeoPanningEnv
 from rl_explore.rl_policy import RLGeoPolicy
@@ -298,8 +296,8 @@ def evaluate_policy(
         return float("nan"), float("nan")
     pred_tensor = torch.stack(preds, dim=0)
     true_tensor = torch.stack(trues, dim=0)
-    med_km, mean_km = median_geodesic_km(pred_tensor, true_tensor)
-    return med_km, mean_km
+    med_score, mean_score = median_geoguessr_score(pred_tensor, true_tensor)
+    return med_score, mean_score
 
 
 def main() -> None:
@@ -424,19 +422,19 @@ def main() -> None:
         # Periodic evaluation on validation set (subset for speed).
         if val_samples:
             subset = val_samples[: min(512, len(val_samples))]
-            med_km, mean_km = evaluate_policy(subset, policy, device, max_steps=args.max_steps)
+            med_score, mean_score = evaluate_policy(subset, policy, device, max_steps=args.max_steps)
             print(
-                f"  Val median geodesic: {med_km:.2f} km | "
-                f"mean: {mean_km:.2f} km"
+                f"  Val median GeoGuessr score: {med_score:.2f} | "
+                f"mean: {mean_score:.2f}"
             )
 
-    # Final evaluation on test set.
+    # Final evaluation on test set (same metric as baseline for comparison).
     if test_samples:
         subset = test_samples[: min(1024, len(test_samples))]
-        med_km, mean_km = evaluate_policy(subset, policy, device, max_steps=args.max_steps)
-        print("\nFinal test performance:")
-        print(f"  Median geodesic distance: {med_km:.2f} km")
-        print(f"  Mean geodesic distance:   {mean_km:.2f} km")
+        med_score, mean_score = evaluate_policy(subset, policy, device, max_steps=args.max_steps)
+        print("\nFinal test performance (GeoGuessr score, 0–5000):")
+        print(f"  Median GeoGuessr score: {med_score:.2f}")
+        print(f"  Mean GeoGuessr score:   {mean_score:.2f}")
 
 
 if __name__ == "__main__":

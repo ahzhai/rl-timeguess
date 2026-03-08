@@ -42,6 +42,11 @@ def haversine_m(lat1_deg, lon1_deg, lat2_deg, lon2_deg):
     return EARTH_RADIUS_M * c
 
 
+def haversine_km(lat1_deg, lon1_deg, lat2_deg, lon2_deg):
+    """Geodesic distance in km between (lat1, lon1) and (lat2, lon2) in degrees (for RL)."""
+    return haversine_m(lat1_deg, lon1_deg, lat2_deg, lon2_deg) / 1000.0
+
+
 def build_path(row, data_root):
     """Build image path from a CSV row (place_id, year, month, northdeg, city_id, lat, lon, panoid)."""
     city_id = row["city_id"]
@@ -142,6 +147,17 @@ def median_geoguessr_score(pred_latlon, true_latlon):
         for i in range(len(pred))
     ]
     return float(torch.tensor(scores).median().item()), sum(scores) / len(scores)
+
+
+def median_geodesic_km(pred_latlon, true_latlon):
+    """pred_latlon, true_latlon: (N, 2) tensors [lat, lon] in degrees. Returns (median_km, mean_km) for RL eval."""
+    pred = pred_latlon.cpu().numpy()
+    true = true_latlon.cpu().numpy()
+    dists = [
+        haversine_km(pred[i, 0], pred[i, 1], true[i, 0], true[i, 1])
+        for i in range(len(pred))
+    ]
+    return float(torch.tensor(dists).median().item()), sum(dists) / len(dists)
 
 
 def main():
