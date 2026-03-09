@@ -25,6 +25,7 @@ import torch.nn.functional as F
 from baseline.train_baseline_CNN import (
     RANDOM_SEED,
     build_path,
+    geoguessr_score,
     load_metadata,
     median_geoguessr_score,
 )
@@ -102,6 +103,14 @@ def rollout(
         else:
             next_obs, reward, done, info = env.step(action_int)
             true_coords = None
+            if done and info.get("forced_termination"):
+                pred_lat, pred_lon = float(pred_coords[0].item()), float(pred_coords[1].item())
+                score = geoguessr_score(pred_lat, pred_lon, env._lat, env._lon)
+                reward += env.alpha * (score / 5000.0)
+                true_coords = torch.tensor(
+                    [env._lat, env._lon], dtype=torch.float32, device=device
+                )
+                n_terminates += 1
 
         ep_ret += reward
 
@@ -291,8 +300,8 @@ def evaluate_policy(
     trues = []
 
     with torch.no_grad():
-        for sample in samples:
-            obs = env.reset()
+        for path, lat, lon in samples:
+            obs = env.reset_to(path, lat, lon)
             embedding_history: List[torch.Tensor] = []
             done = False
             steps = 0

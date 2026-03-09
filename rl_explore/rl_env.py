@@ -114,23 +114,27 @@ class GeoPanningEnv:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def reset(self) -> torch.Tensor:
-        """Start a new episode and return the first crop tensor."""
-        sample = self._rng.choice(self.samples)
-        img_path = Path(sample.path)
+    def _init_episode(self, path: str, lat: float, lon: float) -> torch.Tensor:
+        img_path = Path(path)
         if not img_path.is_file():
             raise FileNotFoundError(f"Image not found: {img_path}")
         self._img = Image.open(img_path).convert("RGB")
         self._img_w, self._img_h = self._img.size
-        self._lat, self._lon = sample.lat, sample.lon
-
-        # Reset camera roughly to center, medium zoom.
+        self._lat, self._lon = lat, lon
         self._center_x = 0.5
         self._center_y = 0.5
         self._zoom_idx = min(1, len(self.zoom_levels) - 1)
         self._t = 0
-
         return self._get_obs()
+
+    def reset(self) -> torch.Tensor:
+        """Start a new episode with a random sample."""
+        s = self._rng.choice(self.samples)
+        return self._init_episode(s.path, s.lat, s.lon)
+
+    def reset_to(self, path: str, lat: float, lon: float) -> torch.Tensor:
+        """Start a new episode with a specific sample."""
+        return self._init_episode(path, lat, lon)
 
     def step(
         self,
