@@ -38,6 +38,7 @@ class Transition:
     """embedding_sequence (1, max_steps, D), mask (1, max_steps) for PPO."""
     embedding_sequence: torch.Tensor
     mask: torch.Tensor
+    camera_states: torch.Tensor
     action: int
     logp: float
     value: float
@@ -70,6 +71,7 @@ def rollout(
 
     obs = env.reset()
     current_episode_embeddings: List[torch.Tensor] = []
+    current_episode_camstates: List[List[float]] = []
     ep_ret = 0.0
     steps_collected = 0
     n_terminates = 0
@@ -78,6 +80,7 @@ def rollout(
         obs_batch = obs.unsqueeze(0).to(device)
         emb = policy.encode(obs_batch)
         current_episode_embeddings.append(emb.detach())
+        current_episode_camstates.append(list(env.camera_state))
 
         T = len(current_episode_embeddings)
         stacked = torch.stack(current_episode_embeddings, dim=1)
@@ -85,8 +88,10 @@ def rollout(
         padded[:, :T] = stacked
         mask = torch.zeros(1, max_steps, device=device, dtype=torch.float32)
         mask[:, :T] = 1.0
+        cam_padded = torch.zeros(1, max_steps, 4, device=device, dtype=torch.float32)
+        cam_padded[:, :T] = torch.tensor(current_episode_camstates, dtype=torch.float32, device=device).unsqueeze(0)
 
-        logits, value, coords = policy(padded, mask)
+        logits, value, coords = policy(padded, mask, cam_padded)
         dist = torch.distributions.Categorical(logits=logits)
         action = dist.sample()
         logp = dist.log_prob(action)
@@ -118,6 +123,7 @@ def rollout(
             Transition(
                 embedding_sequence=padded.detach().to(device),
                 mask=mask.to(device),
+                camera_states=cam_padded.detach().to(device),
                 action=action_int,
                 logp=float(logp.item()),
                 value=float(value.item()),
@@ -136,6 +142,7 @@ def rollout(
             episode_returns.append(ep_ret)
             obs = env.reset()
             current_episode_embeddings = []
+            current_episode_camstates = []
             ep_ret = 0.0
         else:
             obs = next_obs
@@ -175,6 +182,7 @@ def compute_gae(
 
     embedding_sequences_batch = torch.cat([t.embedding_sequence for t in transitions], dim=0)
     masks_batch = torch.cat([t.mask for t in transitions], dim=0)
+    camera_states_batch = torch.cat([t.camera_states for t in transitions], dim=0)
     actions_batch = torch.tensor([t.action for t in transitions], dtype=torch.long)
     logp_batch = torch.tensor([t.logp for t in transitions], dtype=torch.float32)
 
@@ -193,7 +201,7 @@ def compute_gae(
     # Normalize advantages for stability.
     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-    return embedding_sequences_batch, masks_batch, actions_batch, logp_batch, returns, advantages, terminate_mask, true_coords_batch
+    return embedding_sequences_batch, masks_batch, camera_states_batch, actions_batch, logp_batch, returns, advantages, terminate_mask, true_coords_batch
 
 
 def ppo_update(
@@ -201,6 +209,7 @@ def ppo_update(
     optimizer: torch.optim.Optimizer,
     embedding_sequences_batch: torch.Tensor,
     masks_batch: torch.Tensor,
+    camera_states_batch: torch.Tensor,
     actions_batch: torch.Tensor,
     logp_old_batch: torch.Tensor,
     returns_batch: torch.Tensor,
@@ -215,7 +224,7 @@ def ppo_update(
     minibatch_size: int,
     device: torch.device,
 ) -> Tuple[float, float, float, float]:
-    """PPO update over batch; policy(seq, mask) for attention."""
+    """PPO update over batch; policy(seq, mask, cam) for attention."""
     policy.train()
     n = embedding_sequences_batch.size(0)
     indices = torch.arange(n)
@@ -234,6 +243,7 @@ def ppo_update(
             t0 = time.perf_counter()
             seq_mb = embedding_sequences_batch[mb_idx].to(device)
             mask_mb = masks_batch[mb_idx].to(device)
+            cam_mb = camera_states_batch[mb_idx].to(device)
             act_mb = actions_batch[mb_idx].to(device)
             logp_old_mb = logp_old_batch[mb_idx].to(device)
             ret_mb = returns_batch[mb_idx].to(device)
@@ -243,7 +253,7 @@ def ppo_update(
             t_to = time.perf_counter() - t0
 
             t_fwd = time.perf_counter()
-            logits, value, coords = policy(seq_mb, mask_mb)
+            logits, value, coords = policy(seq_mb, mask_mb, cam_mb)
             dist = torch.distributions.Categorical(logits=logits)
             logp = dist.log_prob(act_mb)
             entropy = dist.entropy().mean()
@@ -303,19 +313,23 @@ def evaluate_policy(
         for path, lat, lon in samples:
             obs = env.reset_to(path, lat, lon)
             embedding_history: List[torch.Tensor] = []
+            cam_history: List[List[float]] = []
             done = False
             steps = 0
             while not done and steps < max_steps:
                 obs_b = obs.unsqueeze(0).to(device)
                 emb = policy.encode(obs_b)
                 embedding_history.append(emb)
+                cam_history.append(list(env.camera_state))
                 T = len(embedding_history)
                 stacked = torch.stack(embedding_history, dim=1)
                 padded = torch.zeros(1, max_steps, stacked.shape[2], device=device, dtype=stacked.dtype)
                 padded[:, :T] = stacked
                 mask = torch.zeros(1, max_steps, device=device, dtype=torch.float32)
                 mask[:, :T] = 1.0
-                logits, _, coords = policy(padded, mask)
+                cam_padded = torch.zeros(1, max_steps, 4, device=device, dtype=torch.float32)
+                cam_padded[:, :T] = torch.tensor(cam_history, dtype=torch.float32, device=device).unsqueeze(0)
+                logits, _, coords = policy(padded, mask, cam_padded)
                 dist = torch.distributions.Categorical(logits=logits)
                 action = torch.argmax(dist.logits, dim=-1)
                 action_int = int(action.item())
@@ -444,7 +458,7 @@ def main() -> None:
         )
 
         t_gae_start = time.perf_counter()
-        seq_b, mask_b, act_b, logp_b, ret_b, adv_b, term_mask, true_coords_b = compute_gae(
+        seq_b, mask_b, cam_b, act_b, logp_b, ret_b, adv_b, term_mask, true_coords_b = compute_gae(
             transitions,
             gamma=args.gamma,
             lam=args.gae_lambda,
@@ -458,6 +472,7 @@ def main() -> None:
             optimizer,
             seq_b,
             mask_b,
+            cam_b,
             act_b,
             logp_b,
             ret_b,

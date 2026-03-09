@@ -236,6 +236,12 @@ class GeoPanningEnv:
         tensor = self.transform(crop).to(self.device)
         return tensor
 
+    @property
+    def camera_state(self) -> Tuple[float, float, float, float]:
+        zoom_norm = self._zoom_idx / max(1, len(self.zoom_levels) - 1)
+        step_norm = self._t / max(1, self.max_steps)
+        return (self._center_x, self._center_y, zoom_norm, step_norm)
+
 
 __all__ = ["GeoPanningEnv"]
 

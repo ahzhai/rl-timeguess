@@ -35,6 +35,7 @@ class RLGeoPolicy(nn.Module):
         checkpoint_path: Optional[str] = None,
         num_actions: int = 7,
         hidden_dim: int = 0,
+        camera_state_dim: int = 4,
         device: Optional[torch.device] = None,
     ) -> None:
         super().__init__()
@@ -73,6 +74,8 @@ class RLGeoPolicy(nn.Module):
         self.value_head = nn.Linear(policy_input_dim, 1)
         self.coord_head = nn.Linear(policy_input_dim, 2)
 
+        self.camera_proj = nn.Linear(camera_state_dim, policy_input_dim)
+
         self.attn_query = nn.Parameter(torch.zeros(policy_input_dim))
         self.attn_key = nn.Linear(policy_input_dim, policy_input_dim)
         self.attn_value = nn.Linear(policy_input_dim, policy_input_dim)
@@ -86,9 +89,12 @@ class RLGeoPolicy(nn.Module):
         return feat
 
     def forward(
-        self, embedding_sequence: torch.Tensor, mask: torch.Tensor
+        self, embedding_sequence: torch.Tensor, mask: torch.Tensor,
+        camera_states: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """embedding_sequence (B, T, D), mask (B, T) 1=valid 0=pad -> logits, value, coords."""
+        """embedding_sequence (B, T, D), mask (B, T), camera_states (B, T, 4) -> logits, value, coords."""
+        if camera_states is not None:
+            embedding_sequence = embedding_sequence + self.camera_proj(camera_states)
         B, T, D = embedding_sequence.shape
         K = self.attn_key(embedding_sequence)
         V = self.attn_value(embedding_sequence)
