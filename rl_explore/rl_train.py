@@ -40,6 +40,7 @@ class Transition:
     done: bool
     pred_coords: torch.Tensor
     agg_embedding: torch.Tensor  # aggregated past embeddings (for history); (1, embed_dim)
+    true_coords: torch.Tensor  # (1, 2) ground-truth [lat, lon] for auxiliary loss
 
 
 def select_device() -> torch.device:
@@ -107,6 +108,11 @@ def rollout(
             if history_len > 0
             else torch.zeros(1, embed_dim, device=device)
         )
+        true_coords = torch.tensor(
+            [[info["true_lat"], info["true_lon"]]],
+            device=device,
+            dtype=torch.float32,
+        )
         transitions.append(
             Transition(
                 obs=obs.to(device),
@@ -117,6 +123,7 @@ def rollout(
                 done=done,
                 pred_coords=pred_coords.detach().to(device),
                 agg_embedding=stored_agg,
+                true_coords=true_coords,
             )
         )
         steps_collected += 1
@@ -143,10 +150,10 @@ def compute_gae(
     transitions: List[Transition],
     gamma: float,
     lam: float,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute advantages and returns with GAE.
-    Outputs tensors for obs, actions, old_logp, returns, advantages.
+    Outputs tensors for obs, agg, actions, old_logp, returns, advantages, true_coords.
     """
     rewards = [t.reward for t in transitions]
     values = [t.value for t in transitions]
@@ -170,13 +177,14 @@ def compute_gae(
 
     obs_batch = torch.stack([t.obs for t in transitions], dim=0)
     agg_batch = torch.cat([t.agg_embedding for t in transitions], dim=0)
+    true_coords_batch = torch.cat([t.true_coords for t in transitions], dim=0)
     actions_batch = torch.tensor([t.action for t in transitions], dtype=torch.long)
     logp_batch = torch.tensor([t.logp for t in transitions], dtype=torch.float32)
 
     # Normalize advantages for stability.
     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-    return obs_batch, agg_batch, actions_batch, logp_batch, returns, advantages
+    return obs_batch, agg_batch, actions_batch, logp_batch, returns, advantages, true_coords_batch
 
 
 def ppo_update(
@@ -188,19 +196,21 @@ def ppo_update(
     logp_old_batch: torch.Tensor,
     returns_batch: torch.Tensor,
     adv_batch: torch.Tensor,
+    true_coords_batch: torch.Tensor,
     clip_ratio: float,
     vf_coef: float,
     ent_coef: float,
+    aux_coef: float,
     epochs: int,
     minibatch_size: int,
     device: torch.device,
-) -> Tuple[float, float, float]:
-    """Run several epochs of PPO updates over the collected batch."""
+) -> Tuple[float, float, float, float]:
+    """Run several epochs of PPO updates over the collected batch. Includes auxiliary SmoothL1 loss on coords."""
     policy.train()
     n = obs_batch.size(0)
     indices = torch.arange(n)
 
-    last_pi_loss, last_v_loss, last_ent = 0.0, 0.0, 0.0
+    last_pi_loss, last_v_loss, last_ent, last_aux_loss = 0.0, 0.0, 0.0, 0.0
 
     for _ in range(epochs):
         perm = indices[torch.randperm(n)]
@@ -214,8 +224,9 @@ def ppo_update(
             logp_old_mb = logp_old_batch[mb_idx].to(device)
             ret_mb = returns_batch[mb_idx].to(device)
             adv_mb = adv_batch[mb_idx].to(device)
+            true_coords_mb = true_coords_batch[mb_idx].to(device)
 
-            logits, value, _ = policy(obs_mb, agg_embedding=agg_mb)
+            logits, value, coords = policy(obs_mb, agg_embedding=agg_mb)
             dist = torch.distributions.Categorical(logits=logits)
             logp = dist.log_prob(act_mb)
             entropy = dist.entropy().mean()
@@ -226,8 +237,9 @@ def ppo_update(
             policy_loss = -torch.min(unclipped, clipped).mean()
 
             value_loss = F.mse_loss(value, ret_mb)
+            aux_loss = F.smooth_l1_loss(coords, true_coords_mb)
 
-            loss = policy_loss + vf_coef * value_loss - ent_coef * entropy
+            loss = policy_loss + vf_coef * value_loss - ent_coef * entropy + aux_coef * aux_loss
 
             optimizer.zero_grad()
             loss.backward()
@@ -237,8 +249,9 @@ def ppo_update(
             last_pi_loss = float(policy_loss.item())
             last_v_loss = float(value_loss.item())
             last_ent = float(entropy.item())
+            last_aux_loss = float(aux_loss.item())
 
-    return last_pi_loss, last_v_loss, last_ent
+    return last_pi_loss, last_v_loss, last_ent, last_aux_loss
 
 
 def evaluate_policy(
@@ -342,6 +355,12 @@ def main() -> None:
         default=5,
         help="Number of past embeddings to aggregate (0 = no history).",
     )
+    parser.add_argument(
+        "--aux_coef",
+        type=float,
+        default=0.5,
+        help="Weight for auxiliary SmoothL1 loss on predicted vs true (lat, lon).",
+    )
 
     args = parser.parse_args()
 
@@ -388,13 +407,13 @@ def main() -> None:
 
     for epoch in range(1, args.epochs + 1):
         transitions, ep_returns = rollout(env, policy, args.steps_per_batch, args.gamma, device)
-        obs_b, agg_b, act_b, logp_b, ret_b, adv_b = compute_gae(
+        obs_b, agg_b, act_b, logp_b, ret_b, adv_b, true_coords_b = compute_gae(
             transitions,
             gamma=args.gamma,
             lam=args.gae_lambda,
         )
 
-        pi_loss, v_loss, ent = ppo_update(
+        pi_loss, v_loss, ent, aux_loss = ppo_update(
             policy,
             optimizer,
             obs_b,
@@ -403,9 +422,11 @@ def main() -> None:
             logp_b,
             ret_b,
             adv_b,
+            true_coords_b,
             clip_ratio=args.clip_ratio,
             vf_coef=args.vf_coef,
             ent_coef=args.ent_coef,
+            aux_coef=args.aux_coef,
             epochs=args.ppo_epochs,
             minibatch_size=args.minibatch_size,
             device=device,
@@ -416,7 +437,7 @@ def main() -> None:
             f"Epoch {epoch}/{args.epochs} | "
             f"episodes={len(ep_returns)} | "
             f"avg_return={avg_ret:.3f} | "
-            f"pi_loss={pi_loss:.4f} | v_loss={v_loss:.4f} | ent={ent:.3f}"
+            f"pi_loss={pi_loss:.4f} | v_loss={v_loss:.4f} | ent={ent:.3f} | aux_loss={aux_loss:.4f}"
         )
 
         # Periodic evaluation on validation set (subset for speed).

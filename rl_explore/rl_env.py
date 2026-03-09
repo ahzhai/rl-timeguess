@@ -177,6 +177,9 @@ class GeoPanningEnv:
             done = True
             info["forced_termination"] = True
 
+        # Always expose ground-truth coords for auxiliary supervised loss.
+        info["true_lat"] = self._lat
+        info["true_lon"] = self._lon
         obs = self._get_obs()
         return obs, reward, done, info
 
